@@ -131,16 +131,15 @@ int fs_format(uint64_t totalBlocks, uint64_t blockSize)
     g_superBlock.version = FS_VERSION;
     g_superBlock.totalBlocks = totalBlocks;
     g_superBlock.blockSize = blockSize;
-    // layout: [0]=superblock, [1]=root dir, [2..bitmapEnd]=free-space bitmap
+    // layout: [0]=superblock, [1]=root dir, [2..fatEnd]=File Allocation Table
     g_superBlock.rootDirBlock = 1; // root directory at block 1
-    // compute bitmap blocks to cover all blocks
-    uint64_t bitsNeeded = totalBlocks; // one bit per block
-    uint64_t bytesNeeded = (bitsNeeded + 7) / 8;
-    uint64_t bitmapBlocks = (bytesNeeded + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    g_superBlock.bitmapStart = 2;
-    g_superBlock.bitmapBlocks = bitmapBlocks;
-    // free blocks exclude: superblock, root dir, bitmap region
-    uint64_t reserved = 1 /*SB*/ + 1 /*root*/ + bitmapBlocks;
+    // compute FAT blocks to cover all blocks
+    uint64_t fatEntriesNeeded = totalBlocks; // one FAT entry per block
+    uint64_t fatBlocks = (fatEntriesNeeded * FAT_ENTRY_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    g_superBlock.fatStart = 2;
+    g_superBlock.fatBlocks = fatBlocks;
+    // free blocks exclude: superblock, root dir, FAT region
+    uint64_t reserved = 1 /*SB*/ + 1 /*root*/ + fatBlocks;
     g_superBlock.freeBlocks = (totalBlocks > reserved) ? (totalBlocks - reserved) : 0;
     strcpy(g_superBlock.volumeName, "CSC415-FS");
     g_superBlock.createTime = time(NULL);
@@ -154,11 +153,27 @@ int fs_format(uint64_t totalBlocks, uint64_t blockSize)
         return -1;
     }
 
-    // create root directory
+    // create root directory with "." and ".." entries
     DirBlock rootDir;
-    rootDir.entryCount = 0;
+    rootDir.entryCount = 2; // "." and ".." entries
     rootDir.nextDirBlock = 0;
     memset(rootDir.entries, 0, sizeof(rootDir.entries));
+
+    // Initialize "." entry (self-reference)
+    strcpy(rootDir.entries[0].filename, ".");
+    rootDir.entries[0].fileType = FT_DIR;
+    rootDir.entries[0].startBlock = g_superBlock.rootDirBlock; // points to itself
+    rootDir.entries[0].fileSize = 0;
+    rootDir.entries[0].createTime = (uint32_t)time(NULL);
+    rootDir.entries[0].modifyTime = rootDir.entries[0].createTime;
+
+    // Initialize ".." entry (parent reference - for root, also points to itself)
+    strcpy(rootDir.entries[1].filename, "..");
+    rootDir.entries[1].fileType = FT_DIR;
+    rootDir.entries[1].startBlock = g_superBlock.rootDirBlock; // root's parent is itself
+    rootDir.entries[1].fileSize = 0;
+    rootDir.entries[1].createTime = (uint32_t)time(NULL);
+    rootDir.entries[1].modifyTime = rootDir.entries[1].createTime;
 
     result = LBAwrite(&rootDir, 1, g_superBlock.rootDirBlock);
     if (result != 1)
@@ -167,29 +182,32 @@ int fs_format(uint64_t totalBlocks, uint64_t blockSize)
         return -1;
     }
 
-    // initialize bitmap: 1 = used, 0 = free
-    // allocate a zeroed buffer for bitmap region then mark reserved blocks as used
+    // initialize FAT: mark reserved blocks as used, others as free
     {
-        uint8_t *bitmap = calloc(1, (size_t)(bitmapBlocks * BLOCK_SIZE));
-        if (!bitmap)
+        uint32_t *fat = malloc((size_t)(fatBlocks * BLOCK_SIZE));
+        if (!fat)
         {
-            printf("Failed to alloc bitmap buffer\n");
+            printf("Failed to alloc FAT buffer\n");
             return -1;
         }
-        // mark block 0..(reserved-1) as used
+        // initialize all entries to FAT_FREE first
+        for (uint64_t b = 0; b < totalBlocks; b++)
+        {
+            fat[b] = FAT_FREE;
+        }
+        // mark reserved blocks as used (FAT_RESERVED)
         for (uint64_t b = 0; b < reserved; b++)
         {
-            uint64_t bitIndex = b;
-            bitmap[bitIndex / 8] |= (uint8_t)(1u << (bitIndex % 8));
+            fat[b] = FAT_RESERVED;
         }
-        // write bitmap blocks
-        if (LBAwrite(bitmap, bitmapBlocks, g_superBlock.bitmapStart) != bitmapBlocks)
+        // write FAT blocks
+        if (LBAwrite(fat, fatBlocks, g_superBlock.fatStart) != fatBlocks)
         {
-            printf("Failed to write bitmap\n");
-            free(bitmap);
+            printf("Failed to write FAT\n");
+            free(fat);
             return -1;
         }
-        free(bitmap);
+        free(fat);
     }
 
     printf("File system formatted successfully\n");
@@ -274,79 +292,81 @@ int fs_rename(const char *srcPath, const char *dstPath)
     return 0;
 }
 
-// allocate a free block
+// allocate a free block using FAT (optimized to read only necessary blocks)
 uint64_t fs_allocateBlock(void)
 {
-    // allocate by scanning bitmap for a zero bit
-    uint8_t *bitmap = malloc((size_t)(g_superBlock.bitmapBlocks * BLOCK_SIZE));
-    if (!bitmap)
+    // scan FAT block by block to find a free entry
+    uint32_t fatBuffer[FAT_ENTRIES_PER_BLOCK];
+
+    for (uint64_t fatBlock = 0; fatBlock < g_superBlock.fatBlocks; fatBlock++)
     {
-        printf("Failed to alloc bitmap buffer\n");
-        return 0;
-    }
-    if (LBAread(bitmap, g_superBlock.bitmapBlocks, g_superBlock.bitmapStart) != g_superBlock.bitmapBlocks)
-    {
-        printf("Failed to read bitmap\n");
-        free(bitmap);
-        return 0;
-    }
-    uint64_t allocatedBlock = 0;
-    for (uint64_t bit = 0; bit < g_superBlock.totalBlocks; bit++)
-    {
-        uint64_t byteIndex = bit / 8;
-        uint8_t mask = (uint8_t)(1u << (bit % 8));
-        if ((bitmap[byteIndex] & mask) == 0)
-        { // free
-            bitmap[byteIndex] |= mask;
-            allocatedBlock = bit;
-            break;
+        // read one FAT block
+        if (LBAread(fatBuffer, 1, g_superBlock.fatStart + fatBlock) != 1)
+        {
+            printf("Failed to read FAT block %llu\n", (unsigned long long)fatBlock);
+            return 0;
+        }
+
+        // scan entries in this FAT block
+        for (uint32_t i = 0; i < FAT_ENTRIES_PER_BLOCK; i++)
+        {
+            uint64_t blockNumber = fatBlock * FAT_ENTRIES_PER_BLOCK + i;
+
+            // check if we've scanned all blocks
+            if (blockNumber >= g_superBlock.totalBlocks)
+                break;
+
+            if (fatBuffer[i] == FAT_FREE)
+            {
+                // found a free block, mark it as EOF and write back
+                fatBuffer[i] = FAT_EOF;
+                if (LBAwrite(fatBuffer, 1, g_superBlock.fatStart + fatBlock) != 1)
+                {
+                    printf("Failed to write FAT block %llu\n", (unsigned long long)fatBlock);
+                    return 0;
+                }
+                g_superBlock.freeBlocks--;
+                LBAwrite(&g_superBlock, 1, 0);
+                return blockNumber;
+            }
         }
     }
-    if (allocatedBlock == 0)
-    {
-        printf("No free blocks available\n");
-        free(bitmap);
-        return 0;
-    }
-    if (LBAwrite(bitmap, g_superBlock.bitmapBlocks, g_superBlock.bitmapStart) != g_superBlock.bitmapBlocks)
-    {
-        printf("Failed to write bitmap\n");
-        free(bitmap);
-        return 0;
-    }
-    free(bitmap);
-    g_superBlock.freeBlocks--;
-    LBAwrite(&g_superBlock, 1, 0);
-    return allocatedBlock;
+
+    printf("No free blocks available\n");
+    return 0;
 }
 
-// free a block
+// free a block using FAT (optimized to read only necessary block)
 int fs_freeBlock(uint64_t blockNumber)
 {
-    // read and clear the corresponding bit in bitmap
-    uint8_t *bitmap = malloc((size_t)(g_superBlock.bitmapBlocks * BLOCK_SIZE));
-    if (!bitmap)
+    if (blockNumber >= g_superBlock.totalBlocks)
     {
-        printf("Failed to alloc bitmap buffer\n");
+        printf("Invalid block number: %llu\n", (unsigned long long)blockNumber);
         return -1;
     }
-    if (LBAread(bitmap, g_superBlock.bitmapBlocks, g_superBlock.bitmapStart) != g_superBlock.bitmapBlocks)
+
+    // calculate which FAT block contains this entry
+    uint64_t fatBlock = blockNumber / FAT_ENTRIES_PER_BLOCK;
+    uint32_t fatIndex = blockNumber % FAT_ENTRIES_PER_BLOCK;
+
+    // read the specific FAT block
+    uint32_t fatBuffer[FAT_ENTRIES_PER_BLOCK];
+    if (LBAread(fatBuffer, 1, g_superBlock.fatStart + fatBlock) != 1)
     {
-        printf("Failed to read bitmap\n");
-        free(bitmap);
+        printf("Failed to read FAT block %llu\n", (unsigned long long)fatBlock);
         return -1;
     }
-    uint64_t bit = blockNumber;
-    uint64_t byteIndex = bit / 8;
-    uint8_t mask = (uint8_t)(1u << (bit % 8));
-    bitmap[byteIndex] &= (uint8_t)~mask;
-    if (LBAwrite(bitmap, g_superBlock.bitmapBlocks, g_superBlock.bitmapStart) != g_superBlock.bitmapBlocks)
+
+    // mark the block as free
+    fatBuffer[fatIndex] = FAT_FREE;
+
+    // write the updated FAT block back
+    if (LBAwrite(fatBuffer, 1, g_superBlock.fatStart + fatBlock) != 1)
     {
-        printf("Failed to write bitmap\n");
-        free(bitmap);
+        printf("Failed to write FAT block %llu\n", (unsigned long long)fatBlock);
         return -1;
     }
-    free(bitmap);
+
     g_superBlock.freeBlocks++;
     LBAwrite(&g_superBlock, 1, 0);
     return 0;

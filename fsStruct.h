@@ -25,9 +25,13 @@
 #define MAX_DIR_ENTRIES 6 // maximum 6 directory entries per directory block
 // file data layout constants (fit header into 512 bytes)
 #define MAX_FILE_BLOCKS 120 // (512 - 4 - 4 - 8 - 4) / 4 = 123, leave some padding
-// bitmap helpers
-#define BITS_PER_BYTE 8
-#define BITMAP_BITS_PER_BLOCK (BLOCK_SIZE * BITS_PER_BYTE)
+// FAT helpers
+#define FAT_ENTRY_SIZE 4 // 4 bytes per FAT entry (32-bit)
+#define FAT_ENTRIES_PER_BLOCK (BLOCK_SIZE / FAT_ENTRY_SIZE)
+#define FAT_FREE 0x00000000     // free block
+#define FAT_EOF 0xFFFFFFFF      // end of file
+#define FAT_BAD 0xFFFFFFFE      // bad block
+#define FAT_RESERVED 0xFFFFFFFD // reserved block
 
 // file type definitions
 #define FT_UNUSED 0
@@ -47,12 +51,12 @@ typedef struct
     uint64_t blockSize;    // block size
     uint64_t freeBlocks;   // free blocks
     uint64_t rootDirBlock; // root directory block position
-    // bitmap-based free space tracking
-    uint64_t bitmapStart;  // first LBA of the free-space bitmap
-    uint64_t bitmapBlocks; // number of blocks occupied by the bitmap
-    char volumeName[32];   // volume name
-    time_t createTime;     // creation time
-    time_t lastMountTime;  // last mount time
+    // FAT-based free space tracking
+    uint64_t fatStart;    // first LBA of the File Allocation Table
+    uint64_t fatBlocks;   // number of blocks occupied by the FAT
+    char volumeName[32];  // volume name
+    time_t createTime;    // creation time
+    time_t lastMountTime; // last mount time
 } SuperBlock;
 
 // directory entry structure

@@ -1,0 +1,21 @@
+ls
+pwd
+md testdir
+ls
+cd testdir
+pwd
+touch a.txt
+ls -l
+cat a.txt
+cd ..
+cp2fs host.txt copied.txt
+ls
+cp copied.txt copied2.txt
+ls -l
+cat copied2.txt
+rm copied.txt
+ls
+rm testdir
+ls
+cp2l copied2.txt out_from_fs.txt
+exit
